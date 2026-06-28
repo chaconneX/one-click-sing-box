@@ -1,5 +1,5 @@
-# one-click-hy2-reality-ws
-hy2 & reality & vless-ws & shadowsocks2022 一键安装脚本
+# one-click-sing-box
+基于sing-box的 hy2 & reality & vless-ws & shadowsocks2022 一键安装脚本
 
 # Hysteria 2 + VLESS Reality + VLESS WS TLS + Shadowsocks 2022 一键安装脚本
 
