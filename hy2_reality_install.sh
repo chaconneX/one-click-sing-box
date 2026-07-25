@@ -5,10 +5,12 @@
 # 协议: Hysteria 2 + VLESS Reality Vision + VLESS WS TLS + Shadowsocks 2022
 # 功能: 安装、卸载、灵活证书配置、中转服务器支持
 # 作者: Chaconne
-# 版本: 7.2
+# 版本: 7.3
 #####################################################################
 
-trap 'rm -f /root/hy2*txt /root/vless*txt /root/vless_ws*txt /root/ss2022*txt /root/hy2*png /root/vless*png /root/vless_ws*png /root/ss2022*png /root/share*' EXIT
+# 清理二维码等临时文件。注意不要用 /root/share* ——
+# 那会连同 /root/share_links.txt 一起删掉，而它是要留给用户的分享链接文件
+trap 'rm -f /root/hy2*txt /root/vless*txt /root/vless_ws*txt /root/ss2022*txt /root/hy2*png /root/vless*png /root/vless_ws*png /root/ss2022*png /root/share*png' EXIT
 
 
 set -e
@@ -169,6 +171,14 @@ acme_conf_get() {
     conf="${dir}/$(basename "$dir" | sed 's/_ecc$//').conf"
     [ -f "$conf" ] || return 0
     val=$(sed -n "s/^${key}='\{0,1\}\([^']*\)'\{0,1\}[[:space:]]*\$/\1/p" "$conf" 2>/dev/null | tail -1) || true
+    # acme.sh 把 Le_ReloadCmd / Le_RenewHook 等以 base64 包装后存储
+    case "$val" in
+        __ACME_BASE64__START_*__ACME_BASE64__END_)
+            val=$(printf '%s' "$val" \
+                | sed 's/^__ACME_BASE64__START_//; s/__ACME_BASE64__END_$//' \
+                | base64 -d 2>/dev/null) || val=""
+            ;;
+    esac
     printf '%s' "$val"
 }
 
@@ -488,8 +498,9 @@ renew_certificate() {
     fi
 
     # 重新安装证书到 sing-box 的路径
-    # reloadcmd 使用 restart: sing-box 不会在 SIGHUP 时重新加载 TLS 证书,
-    # 只 reload 会导致续期成功但服务仍在使用旧证书
+    # reloadcmd 优先 reload (SIGHUP): sing-box 会先 check 配置再重建实例,
+    # 新证书有问题时旧实例仍在运行; reload 不可用时回退到 restart。
+    # 原实现结尾的 "2>/dev/null || true" 会吞掉失败, 让 acme.sh 永远认为重载成功
     print_info "正在安装新证书到 ${CERT_DIR} ..."
     mkdir -p "$CERT_DIR"
 
@@ -499,7 +510,7 @@ renew_certificate() {
         $ecc_flag \
         --key-file "$CERT_KEY" \
         --fullchain-file "$CERT_FILE" \
-        --reloadcmd "systemctl restart sing-box" 2>&1) || install_status=$?
+        --reloadcmd "systemctl reload sing-box || systemctl restart sing-box" 2>&1) || install_status=$?
 
     {
         echo "===== $(date '+%F %T') install-cert ${cert_domain} status=${install_status} ====="
@@ -526,13 +537,19 @@ renew_certificate() {
         print_info "acme.sh 可能复用了未过期的证书，如需强制更换请选择「强制续期证书」"
     fi
 
-    # 重载服务并确认状态
-    systemctl restart sing-box 2>/dev/null || true
+    # 上面的 --install-cert 已经执行过 reloadcmd, 这里只确认服务状态
     sleep 1
     if systemctl is-active --quiet sing-box 2>/dev/null; then
-        print_success "sing-box 已重启并加载新证书"
+        print_success "sing-box 已重载并加载新证书"
     else
-        print_warning "sing-box 未处于运行状态，请执行 systemctl status sing-box 检查"
+        print_warning "sing-box 未在运行，尝试重启..."
+        systemctl restart sing-box 2>/dev/null || true
+        sleep 1
+        if systemctl is-active --quiet sing-box 2>/dev/null; then
+            print_success "sing-box 已重启并加载新证书"
+        else
+            print_error "sing-box 启动失败，请执行 journalctl -u sing-box -n 50 检查"
+        fi
     fi
 
     local new_expire
@@ -555,17 +572,47 @@ fix_auto_renewal() {
 
     print_info "正在修复自动续期..."
 
-    # cron 服务本身必须在运行
+    # cron 服务必须存在并处于运行状态, 否则 acme.sh 的定时任务永远不会被触发
     local cron_svc=""
-    for svc in cron crond cronie; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-            cron_svc="$svc"
-            break
+    find_cron_svc() {
+        local svc
+        for svc in cron crond cronie; do
+            if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+                printf '%s' "$svc"
+                return 0
+            fi
+        done
+    }
+    cron_svc=$(find_cron_svc)
+
+    if [ -z "$cron_svc" ]; then
+        print_warning "系统未安装 cron，正在安装..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq cron >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y cronie >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y cronie >/dev/null 2>&1 || true
         fi
-    done
-    if [ -n "$cron_svc" ] && ! systemctl is-active --quiet "$cron_svc" 2>/dev/null; then
-        print_warning "${cron_svc} 服务未运行，正在启动..."
-        systemctl enable --now "$cron_svc" >/dev/null 2>&1 || true
+        cron_svc=$(find_cron_svc)
+        if [ -z "$cron_svc" ]; then
+            print_error "cron 安装失败，自动续期无法工作，请手动安装 cron/cronie"
+        fi
+    fi
+
+    if [ -n "$cron_svc" ]; then
+        if systemctl is-active --quiet "$cron_svc" 2>/dev/null; then
+            print_success "cron 服务 (${cron_svc}) 运行中"
+        else
+            print_warning "${cron_svc} 服务未运行，正在启动..."
+            systemctl enable --now "$cron_svc" >/dev/null 2>&1 || true
+            if systemctl is-active --quiet "$cron_svc" 2>/dev/null; then
+                print_success "cron 服务 (${cron_svc}) 已启动并设为开机自启"
+            else
+                print_error "cron 服务启动失败，自动续期无法工作"
+            fi
+        fi
     fi
 
     # 安装 acme.sh 的 cron 任务
@@ -578,7 +625,7 @@ fix_auto_renewal() {
         print_error "cron 任务安装失败，请手动检查 crontab -l"
     fi
 
-    # 同时修正 reloadcmd: 保证自动续期后 sing-box 真正加载新证书
+    # 同时重建 reloadcmd: 确保自动续期后触发重载, 且失败不再被静默吞掉
     local cert_domain domain_dir ecc_flag
     cert_domain=$(cert_domain_from_file)
     domain_dir=$(acme_domain_dir "$cert_domain")
@@ -592,13 +639,39 @@ fix_auto_renewal() {
             $ecc_flag \
             --key-file "$CERT_KEY" \
             --fullchain-file "$CERT_FILE" \
-            --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1; then
+            --reloadcmd "systemctl reload sing-box || systemctl restart sing-box" >/dev/null 2>&1; then
             chmod 644 "$CERT_FILE" 2>/dev/null || true
             chmod 600 "$CERT_KEY" 2>/dev/null || true
-            print_success "已更新证书安装路径与重载命令 (自动续期后会重启 sing-box)"
+            print_success "已更新证书安装路径与重载命令"
         else
             print_warning "更新 reloadcmd 失败，自动续期后可能需要手动重启 sing-box"
         fi
+
+        # 回读 acme.sh 中实际生效的配置, 确认自动续期链路真的接通了
+        echo ""
+        print_info "自动续期自检 (读取 acme.sh 中实际生效的配置):"
+        local wired_chain wired_key wired_reload wired_next
+        wired_chain=$(acme_conf_get "$domain_dir" "Le_RealFullChainPath")
+        wired_key=$(acme_conf_get "$domain_dir" "Le_RealKeyPath")
+        wired_reload=$(acme_conf_get "$domain_dir" "Le_ReloadCmd")
+        wired_next=$(acme_conf_get "$domain_dir" "Le_NextRenewTimeStr")
+
+        if [ "$wired_chain" = "$CERT_FILE" ]; then
+            echo -e "    证书写入: ${GREEN}${wired_chain}${NC}"
+        else
+            echo -e "    证书写入: ${RED}${wired_chain:-未设置}${NC} (期望 ${CERT_FILE})"
+        fi
+        if [ "$wired_key" = "$CERT_KEY" ]; then
+            echo -e "    私钥写入: ${GREEN}${wired_key}${NC}"
+        else
+            echo -e "    私钥写入: ${RED}${wired_key:-未设置}${NC} (期望 ${CERT_KEY})"
+        fi
+        if [ -n "$wired_reload" ]; then
+            echo -e "    重载命令: ${GREEN}${wired_reload}${NC}"
+        else
+            echo -e "    重载命令: ${RED}未设置 (续期后 sing-box 不会加载新证书)${NC}"
+        fi
+        [ -n "$wired_next" ] && echo -e "    下次续期: ${GREEN}${wired_next}${NC}"
     fi
 
     cert_menu_return
@@ -726,7 +799,7 @@ show_main_menu() {
     cat << "EOF"
 ╔═══════════════════════════════════════════════════╗
 ║                                                   ║
-║       Sing-box 管理脚本 v7.2                      ║
+║       Sing-box 管理脚本 v7.3                      ║
 ║                                                   ║
 ║   Hy2 + Reality + WS TLS + Shadowsocks 2022       ║
 ║   支持中转服务器模式 + VPS调优                    ║
@@ -1854,14 +1927,14 @@ setup_certificate() {
             --force 2>&1 | grep -E "success|error|failed" || true
     fi
     
-    # reloadcmd 使用 restart: sing-box 不会在 SIGHUP 时重新加载 TLS 证书，
-    # 只 reload 会导致自动续期成功但服务仍在使用旧证书
+    # reloadcmd 优先 reload (SIGHUP)，失败时回退 restart；
+    # 不再用 "|| true" 吞掉错误，否则 acme.sh 无法感知重载失败
     ~/.acme.sh/acme.sh --install-cert \
         -d ${CERT_DOMAIN} \
         --ecc \
         --key-file /etc/sing-box/certs/private.key \
         --fullchain-file /etc/sing-box/certs/cert.crt \
-        --reloadcmd "systemctl restart sing-box" \
+        --reloadcmd "systemctl reload sing-box || systemctl restart sing-box" \
         >/dev/null 2>&1 || true
 
     # 确保自动续期的 cron 任务已安装
@@ -2192,10 +2265,15 @@ start_service() {
     print_info "启动 sing-box 服务..."
     
     systemctl enable sing-box >/dev/null 2>&1
-    systemctl start sing-box
-    
+
+    # 必须用 restart 而不是 start:
+    # 重新安装时旧的 sing-box 仍在运行, 对已运行的 unit 执行 start 是空操作,
+    # 服务会继续使用内存中的旧配置, 而分享链接/二维码用的是新生成的
+    # UUID/密码/端口, 导致所有协议都连不上, 但脚本仍显示"启动成功"。
+    systemctl restart sing-box
+
     sleep 3
-    
+
     if systemctl is-active --quiet sing-box; then
         print_success "sing-box 服务启动成功"
     else
