@@ -5,10 +5,12 @@
 # 协议: Hysteria 2 + VLESS Reality Vision + VLESS WS TLS + Shadowsocks 2022
 # 功能: 安装、卸载、灵活证书配置、中转服务器支持
 # 作者: Chaconne
-# 版本: 7.2
+# 版本: 7.3
 #####################################################################
 
-trap 'rm -f /root/hy2*txt /root/vless*txt /root/vless_ws*txt /root/ss2022*txt /root/hy2*png /root/vless*png /root/vless_ws*png /root/ss2022*png /root/share*' EXIT
+# 清理二维码等临时文件。注意不要用 /root/share* ——
+# 那会连同 /root/share_links.txt 一起删掉，而它是要留给用户的分享链接文件
+trap 'rm -f /root/hy2*txt /root/vless*txt /root/vless_ws*txt /root/ss2022*txt /root/hy2*png /root/vless*png /root/vless_ws*png /root/ss2022*png /root/share*png' EXIT
 
 
 set -e
@@ -797,7 +799,7 @@ show_main_menu() {
     cat << "EOF"
 ╔═══════════════════════════════════════════════════╗
 ║                                                   ║
-║       Sing-box 管理脚本 v7.2                      ║
+║       Sing-box 管理脚本 v7.3                      ║
 ║                                                   ║
 ║   Hy2 + Reality + WS TLS + Shadowsocks 2022       ║
 ║   支持中转服务器模式 + VPS调优                    ║
@@ -2263,10 +2265,15 @@ start_service() {
     print_info "启动 sing-box 服务..."
     
     systemctl enable sing-box >/dev/null 2>&1
-    systemctl start sing-box
-    
+
+    # 必须用 restart 而不是 start:
+    # 重新安装时旧的 sing-box 仍在运行, 对已运行的 unit 执行 start 是空操作,
+    # 服务会继续使用内存中的旧配置, 而分享链接/二维码用的是新生成的
+    # UUID/密码/端口, 导致所有协议都连不上, 但脚本仍显示"启动成功"。
+    systemctl restart sing-box
+
     sleep 3
-    
+
     if systemctl is-active --quiet sing-box; then
         print_success "sing-box 服务启动成功"
     else
