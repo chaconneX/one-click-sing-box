@@ -103,7 +103,7 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/chaconneX/one-c
 - 显示申请方式（Standalone / DNS API）与 acme.sh 计划续期时间
 - **一键续期证书** → 按 acme.sh 规则续期（到期前 30 天内才会真正续期）
 - **强制续期证书** → 忽略剩余天数立即重签，注意 Let's Encrypt 对同一组域名有 **每周 5 张** 的限制
-- **修复自动续期** → 重建 acme.sh cron 任务，并修正续期后的服务重载命令
+- **修复自动续期** → 检查并启动 cron 服务、重建 acme.sh 定时任务、重建证书写入路径与重载命令，最后回读 acme.sh 配置做自检
 - **查看续期日志** → 续期过程记录在 `/var/log/sing-box-cert.log`
 
 > 续期失败时会打印 acme.sh 的完整错误输出和常见原因排查清单，不会再静默退出。
@@ -247,7 +247,7 @@ journalctl -u sing-box -f
 
 | 版本 | 新增内容 |
 |------|---------|
-| v7.2 | 修复一键续期证书失效问题（`set -e` 导致续期失败时静默退出）；新增强制续期、续期日志；修正自动续期后的服务重载命令 |
+| v7.2 | 修复一键续期证书失效问题（`set -e` 导致续期失败时静默退出）；新增强制续期、续期日志；「修复自动续期」增加 cron 服务检查与配置自检 |
 | v7.1 | 新增时钟同步菜单，解决 SS2022 bad timestamp 问题 |
 | v7.0 | 新增 Shadowsocks 2022 协议；支持按需选择安装协议 |
 | v6.0 | 新增 VPS 系统调优（BBR + TCP/UDP优化） |
