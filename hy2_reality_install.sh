@@ -5,7 +5,7 @@
 # 协议: Hysteria 2 + VLESS Reality Vision + VLESS WS TLS + Shadowsocks 2022
 # 功能: 安装、卸载、灵活证书配置、中转服务器支持
 # 作者: Chaconne
-# 版本: 7.1
+# 版本: 7.2
 #####################################################################
 
 trap 'rm -f /root/hy2*txt /root/vless*txt /root/vless_ws*txt /root/ss2022*txt /root/hy2*png /root/vless*png /root/vless_ws*png /root/ss2022*png /root/share*' EXIT
@@ -114,6 +114,102 @@ check_root() {
 # 证书管理
 #####################################################################
 
+CERT_DIR="/etc/sing-box/certs"
+CERT_FILE="${CERT_DIR}/cert.crt"
+CERT_KEY="${CERT_DIR}/private.key"
+ACME_HOME="${HOME}/.acme.sh"
+ACME_BIN="${ACME_HOME}/acme.sh"
+CERT_LOG="/var/log/sing-box-cert.log"
+
+# 读取证书字段 (去掉 "subject="/"issuer="/"notAfter=" 前缀)
+cert_field() {
+    openssl x509 -in "$CERT_FILE" -noout "$1" 2>/dev/null | sed 's/^[^=]*=//; s/^[[:space:]]*//' || true
+}
+
+# 从证书 CN 中提取域名 (使用 POSIX sed, 避免 grep -P 在部分系统不可用)
+cert_domain_from_file() {
+    openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null \
+        | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' \
+        | sed 's/[[:space:]]*$//' || true
+}
+
+# 证书指纹, 用于确认续期后文件确实发生了变化
+cert_fingerprint() {
+    openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//' || true
+}
+
+# 判断是否自签名证书
+cert_is_self_signed() {
+    local s i
+    s=$(cert_field -subject)
+    i=$(cert_field -issuer)
+    if [ -z "$s" ]; then
+        return 1
+    fi
+    if [ "$s" = "$i" ] || printf '%s' "$i" | grep -q "bing.com"; then
+        return 0
+    fi
+    return 1
+}
+
+# 定位 acme.sh 中该域名的记录目录 (优先 ECC)
+acme_domain_dir() {
+    local d="$1"
+    if [ -d "${ACME_HOME}/${d}_ecc" ]; then
+        printf '%s' "${ACME_HOME}/${d}_ecc"
+    elif [ -d "${ACME_HOME}/${d}" ]; then
+        printf '%s' "${ACME_HOME}/${d}"
+    fi
+}
+
+# 读取 acme.sh 域名配置项 (如 Le_Webroot / Le_NextRenewTimeStr)
+acme_conf_get() {
+    local dir="$1" key="$2" conf val
+    [ -n "$dir" ] || return 0
+    conf="${dir}/$(basename "$dir" | sed 's/_ecc$//').conf"
+    [ -f "$conf" ] || return 0
+    val=$(sed -n "s/^${key}='\{0,1\}\([^']*\)'\{0,1\}[[:space:]]*\$/\1/p" "$conf" 2>/dev/null | tail -1) || true
+    printf '%s' "$val"
+}
+
+# acme.sh 把 DNS API 凭据以 SAVED_xxx 形式存在 account.conf 中,
+# 这里显式导出一份, 避免续期时因为凭据未加载而失败
+acme_export_saved_creds() {
+    local conf="${ACME_HOME}/account.conf" line key val
+    [ -f "$conf" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            SAVED_*=*)
+                key=${line%%=*}
+                val=${line#*=}
+                key=${key#SAVED_}
+                val=${val#\'}
+                val=${val%\'}
+                [ -n "$key" ] && export "${key}=${val}"
+                ;;
+        esac
+    done < "$conf"
+    return 0
+}
+
+# 检查 80 端口是否被占用 (standalone 模式续期需要独占 80 端口)
+port_80_in_use() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE '(^|[:.])80$'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|[:.])80$'
+    else
+        return 1
+    fi
+}
+
+# 找出占用 80 端口的进程名
+port_80_owner() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnpH 2>/dev/null | awk '$4 ~ /(^|[:.])80$/ {print $NF}' | head -1
+    fi
+}
+
 show_cert_menu() {
     clear
     echo -e "${CYAN}═══════════════════════════════════════${NC}"
@@ -122,8 +218,8 @@ show_cert_menu() {
     echo ""
 
     # 检查证书是否存在
-    if [ ! -f /etc/sing-box/certs/cert.crt ]; then
-        print_error "未找到证书文件"
+    if [ ! -f "$CERT_FILE" ]; then
+        print_error "未找到证书文件 ($CERT_FILE)"
         echo ""
         echo -e "${YELLOW}按任意键返回主菜单...${NC}"
         read -n 1
@@ -132,14 +228,15 @@ show_cert_menu() {
     fi
 
     # 显示证书信息
-    local cert_file="/etc/sing-box/certs/cert.crt"
     local cert_subject cert_issuer cert_expire cert_expire_epoch now_epoch days_left
-
-    cert_subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/subject=//;s/^ *//')
-    cert_issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/issuer=//;s/^ *//')
-    cert_expire=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
-    cert_expire_epoch=$(date -d "$cert_expire" +%s 2>/dev/null)
+    cert_subject=$(cert_field -subject)
+    cert_issuer=$(cert_field -issuer)
+    cert_expire=$(cert_field -enddate)
     now_epoch=$(date +%s)
+    cert_expire_epoch=""
+    if [ -n "$cert_expire" ]; then
+        cert_expire_epoch=$(date -d "$cert_expire" +%s 2>/dev/null || true)
+    fi
 
     if [ -n "$cert_expire_epoch" ]; then
         days_left=$(( (cert_expire_epoch - now_epoch) / 86400 ))
@@ -163,46 +260,68 @@ show_cert_menu() {
         fi
     fi
 
-    # 检查是否为自签名证书
     local is_self_signed=false
-    if echo "$cert_issuer" | grep -q "bing.com" || [ "$cert_subject" = "$cert_issuer" ]; then
+    if cert_is_self_signed; then
         is_self_signed=true
     fi
 
-    # 检查 acme.sh 自动续期状态
     echo ""
-    if [ -d "$HOME/.acme.sh" ]; then
+    if [ "$is_self_signed" = true ]; then
+        echo -e "  证书类型:  ${YELLOW}自签名证书 (无需续期)${NC}"
+    elif [ -f "$ACME_BIN" ]; then
+        local cert_domain domain_dir mode next_time
+        cert_domain=$(cert_domain_from_file)
+        domain_dir=$(acme_domain_dir "$cert_domain")
+
+        if [ -n "$domain_dir" ]; then
+            mode=$(acme_conf_get "$domain_dir" "Le_Webroot")
+            case "$mode" in
+                no|"")     echo -e "  申请方式:  ${GREEN}Standalone (需要 80 端口)${NC}" ;;
+                dns_*)     echo -e "  申请方式:  ${GREEN}DNS API (${mode})${NC}" ;;
+                *)         echo -e "  申请方式:  ${GREEN}${mode}${NC}" ;;
+            esac
+            next_time=$(acme_conf_get "$domain_dir" "Le_NextRenewTimeStr")
+            [ -n "$next_time" ] && echo -e "  计划续期:  ${GREEN}${next_time}${NC}"
+        else
+            echo -e "  acme 记录: ${RED}未找到 ${cert_domain} 的签发记录${NC}"
+        fi
+
         if crontab -l 2>/dev/null | grep -q '.acme.sh'; then
             echo -e "  自动续期:  ${GREEN}已启用 (acme.sh cron)${NC}"
         else
             echo -e "  自动续期:  ${RED}未启用 (cron 任务缺失)${NC}"
         fi
     else
-        if [ "$is_self_signed" = true ]; then
-            echo -e "  证书类型:  ${YELLOW}自签名证书 (无需续期)${NC}"
-        else
-            echo -e "  自动续期:  ${RED}未安装 acme.sh${NC}"
-        fi
+        echo -e "  自动续期:  ${RED}未安装 acme.sh${NC}"
     fi
 
     echo ""
     echo -e "${CYAN}───────────────────────────────────────${NC}"
     echo ""
     echo "  1) 一键续期证书"
-    echo "  2) 修复自动续期 (重建 cron 任务)"
-    echo "  3) 返回主菜单"
+    echo "  2) 强制续期证书 (忽略剩余天数)"
+    echo "  3) 修复自动续期 (重建 cron 任务)"
+    echo "  4) 查看续期日志"
+    echo "  5) 返回主菜单"
     echo ""
 
-    read -p "请输入选项 [1-3]: " cert_choice
+    local cert_choice
+    read -p "请输入选项 [1-5]: " cert_choice
 
     case $cert_choice in
         1)
-            renew_certificate
+            renew_certificate false
             ;;
         2)
-            fix_auto_renewal
+            renew_certificate true
             ;;
         3)
+            fix_auto_renewal
+            ;;
+        4)
+            show_cert_log
+            ;;
+        5)
             show_main_menu
             ;;
         *)
@@ -213,121 +332,276 @@ show_cert_menu() {
     esac
 }
 
-renew_certificate() {
-    echo ""
-
-    # 检查是否为自签名证书
-    local cert_issuer
-    cert_issuer=$(openssl x509 -in /etc/sing-box/certs/cert.crt -noout -issuer 2>/dev/null | sed 's/issuer=//;s/^ *//')
-    if echo "$cert_issuer" | grep -q "bing.com"; then
-        print_error "当前使用的是自签名证书，无法通过 acme.sh 续期"
-        print_info "如需使用 Let's Encrypt 证书，请重新安装并选择 Let's Encrypt 方式"
-        echo ""
-        echo -e "${YELLOW}按任意键返回...${NC}"
-        read -n 1
-        show_cert_menu
-        return
-    fi
-
-    # 检查 acme.sh 是否存在
-    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
-        print_error "未找到 acme.sh，无法续期证书"
-        print_info "请重新安装并选择 Let's Encrypt 证书方式"
-        echo ""
-        echo -e "${YELLOW}按任意键返回...${NC}"
-        read -n 1
-        show_cert_menu
-        return
-    fi
-
-    # 获取证书域名
-    local cert_domain
-    cert_domain=$(openssl x509 -in /etc/sing-box/certs/cert.crt -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^ ,]+')
-
-    if [ -z "$cert_domain" ]; then
-        print_error "无法从证书中获取域名"
-        echo ""
-        echo -e "${YELLOW}按任意键返回...${NC}"
-        read -n 1
-        show_cert_menu
-        return
-    fi
-
-    print_info "正在续期证书: ${cert_domain} ..."
-
-    # 强制续期
-    local renew_output
-    renew_output=$(~/.acme.sh/acme.sh --renew -d "${cert_domain}" --ecc --force 2>&1)
-    local renew_status=$?
-
-    if [ $renew_status -eq 0 ]; then
-        # 重新安装证书到目标路径
-        ~/.acme.sh/acme.sh --install-cert \
-            -d "${cert_domain}" \
-            --ecc \
-            --key-file /etc/sing-box/certs/private.key \
-            --fullchain-file /etc/sing-box/certs/cert.crt \
-            --reloadcmd "systemctl reload sing-box 2>/dev/null || true" \
-            >/dev/null 2>&1
-
-        chmod 644 /etc/sing-box/certs/cert.crt
-        chmod 600 /etc/sing-box/certs/private.key
-
-        # 重载服务
-        systemctl reload sing-box 2>/dev/null || systemctl restart sing-box 2>/dev/null || true
-
-        local new_expire
-        new_expire=$(openssl x509 -in /etc/sing-box/certs/cert.crt -noout -enddate | cut -d= -f2)
-
-        echo ""
-        print_success "证书续期成功！"
-        print_info "新的到期时间: ${new_expire}"
-    else
-        echo ""
-        print_error "证书续期失败"
-        echo -e "${YELLOW}错误信息:${NC}"
-        echo "$renew_output" | tail -5
-        echo ""
-        print_info "可能的原因:"
-        echo "  - Cloudflare API Token 已失效"
-        echo "  - 域名 DNS 已变更"
-        echo "  - 网络连接问题"
-    fi
-
+cert_menu_return() {
     echo ""
     echo -e "${YELLOW}按任意键返回...${NC}"
     read -n 1
     show_cert_menu
 }
 
+show_cert_log() {
+    echo ""
+    if [ -f "$CERT_LOG" ]; then
+        print_info "最近的续期日志 ($CERT_LOG):"
+        echo -e "${CYAN}───────────────────────────────────────${NC}"
+        tail -50 "$CERT_LOG" 2>/dev/null || true
+        echo -e "${CYAN}───────────────────────────────────────${NC}"
+    else
+        print_info "暂无续期日志 (尚未通过本脚本执行过续期)"
+    fi
+
+    if [ -f "${ACME_HOME}/acme.sh.log" ]; then
+        echo ""
+        print_info "acme.sh 自身日志末尾 (${ACME_HOME}/acme.sh.log):"
+        echo -e "${CYAN}───────────────────────────────────────${NC}"
+        tail -20 "${ACME_HOME}/acme.sh.log" 2>/dev/null || true
+        echo -e "${CYAN}───────────────────────────────────────${NC}"
+    fi
+
+    cert_menu_return
+}
+
+# $1: true = 强制续期 (--force)
+renew_certificate() {
+    local force_renew="${1:-false}"
+    echo ""
+
+    # 自签名证书无法通过 acme.sh 续期
+    if cert_is_self_signed; then
+        print_error "当前使用的是自签名证书，无法通过 acme.sh 续期"
+        print_info "如需使用 Let's Encrypt 证书，请重新安装并选择 Let's Encrypt 方式"
+        cert_menu_return
+        return
+    fi
+
+    if [ ! -f "$ACME_BIN" ]; then
+        print_error "未找到 acme.sh ($ACME_BIN)，无法续期证书"
+        print_info "请重新安装并选择 Let's Encrypt 证书方式"
+        cert_menu_return
+        return
+    fi
+
+    # 获取证书域名
+    local cert_domain
+    cert_domain=$(cert_domain_from_file)
+    if [ -z "$cert_domain" ]; then
+        print_error "无法从证书中获取域名"
+        print_info "证书 subject: $(cert_field -subject)"
+        cert_menu_return
+        return
+    fi
+
+    # 定位 acme.sh 的签发记录, 判断 ECC / 申请方式
+    local domain_dir ecc_flag issue_mode
+    domain_dir=$(acme_domain_dir "$cert_domain")
+    if [ -z "$domain_dir" ]; then
+        print_error "acme.sh 中没有域名 ${cert_domain} 的签发记录，无法续期"
+        print_info "acme.sh 已知的证书列表:"
+        "$ACME_BIN" --list 2>/dev/null || true
+        echo ""
+        print_info "若域名已变更，请重新运行安装流程重新申请证书"
+        cert_menu_return
+        return
+    fi
+
+    ecc_flag=""
+    case "$domain_dir" in
+        *_ecc) ecc_flag="--ecc" ;;
+    esac
+    issue_mode=$(acme_conf_get "$domain_dir" "Le_Webroot")
+
+    # standalone 模式必须能独占 80 端口
+    if [ "$issue_mode" = "no" ] || [ -z "$issue_mode" ]; then
+        if port_80_in_use; then
+            local owner
+            owner=$(port_80_owner)
+            print_error "80 端口已被占用，Standalone 模式无法完成验证"
+            [ -n "$owner" ] && print_info "占用进程: ${owner}"
+            print_info "请先停止占用 80 端口的服务后重试，或改用 Cloudflare DNS API 方式"
+            cert_menu_return
+            return
+        fi
+    fi
+
+    # 恢复 DNS API 凭据 (Cloudflare 等)
+    acme_export_saved_creds
+
+    mkdir -p "$(dirname "$CERT_LOG")" 2>/dev/null || true
+    local fp_before
+    fp_before=$(cert_fingerprint "$CERT_FILE")
+
+    if [ "$force_renew" = true ]; then
+        print_info "正在强制续期证书: ${cert_domain} ..."
+        print_warning "Let's Encrypt 对同一组域名有每周 5 张的重复签发限制，请勿频繁强制续期"
+    else
+        print_info "正在续期证书: ${cert_domain} ..."
+    fi
+    echo ""
+
+    # 执行续期。注意: 脚本开头有 set -e，
+    # 这里必须用 if/|| 捕获退出码，否则 acme.sh 一旦返回非 0，
+    # 整个脚本会直接静默退出，用户看不到任何错误提示。
+    local renew_output renew_status=0
+    if [ "$force_renew" = true ]; then
+        renew_output=$("$ACME_BIN" --renew -d "$cert_domain" $ecc_flag --force 2>&1) || renew_status=$?
+    else
+        renew_output=$("$ACME_BIN" --renew -d "$cert_domain" $ecc_flag 2>&1) || renew_status=$?
+    fi
+
+    {
+        echo "===== $(date '+%F %T') renew ${cert_domain} (force=${force_renew}) status=${renew_status} ====="
+        echo "$renew_output"
+    } >> "$CERT_LOG" 2>/dev/null || true
+
+    # 尚未到续期时间: acme.sh 返回非 0，但这不是错误
+    if [ $renew_status -ne 0 ] && printf '%s' "$renew_output" | grep -qi "Skip, Next renewal time is"; then
+        print_warning "证书尚未到续期时间，acme.sh 跳过了本次续期"
+        print_info "acme.sh 默认在证书到期前 30 天才会续期，这属于正常行为"
+        print_info "如需立即更换证书，请在证书管理菜单中选择「强制续期证书」"
+        cert_menu_return
+        return
+    fi
+
+    if [ $renew_status -ne 0 ]; then
+        print_error "证书续期失败 (acme.sh 退出码: ${renew_status})"
+        echo ""
+        echo -e "${YELLOW}错误信息:${NC}"
+        printf '%s\n' "$renew_output" | tail -20
+        echo ""
+        print_info "可能的原因:"
+        case "$issue_mode" in
+            dns_*)
+                echo "  - DNS API 凭据失效 (如 Cloudflare API Token 过期或权限不足)"
+                echo "  - 域名已不在该 DNS 账户下"
+                ;;
+            *)
+                echo "  - 80 端口被占用或被防火墙拦截"
+                echo "  - 域名 A 记录未指向本机 IP"
+                ;;
+        esac
+        echo "  - 触发 Let's Encrypt 速率限制 (同一组域名每周最多 5 张)"
+        echo "  - 服务器时间不同步 / 无法访问 ACME 服务器"
+        echo ""
+        print_info "完整日志: ${CERT_LOG}"
+        cert_menu_return
+        return
+    fi
+
+    # 重新安装证书到 sing-box 的路径
+    # reloadcmd 使用 restart: sing-box 不会在 SIGHUP 时重新加载 TLS 证书,
+    # 只 reload 会导致续期成功但服务仍在使用旧证书
+    print_info "正在安装新证书到 ${CERT_DIR} ..."
+    mkdir -p "$CERT_DIR"
+
+    local install_output install_status=0
+    install_output=$("$ACME_BIN" --install-cert \
+        -d "$cert_domain" \
+        $ecc_flag \
+        --key-file "$CERT_KEY" \
+        --fullchain-file "$CERT_FILE" \
+        --reloadcmd "systemctl restart sing-box" 2>&1) || install_status=$?
+
+    {
+        echo "===== $(date '+%F %T') install-cert ${cert_domain} status=${install_status} ====="
+        echo "$install_output"
+    } >> "$CERT_LOG" 2>/dev/null || true
+
+    if [ $install_status -ne 0 ]; then
+        print_error "证书安装失败 (acme.sh 退出码: ${install_status})"
+        echo ""
+        printf '%s\n' "$install_output" | tail -20
+        print_info "完整日志: ${CERT_LOG}"
+        cert_menu_return
+        return
+    fi
+
+    chmod 644 "$CERT_FILE" 2>/dev/null || true
+    chmod 600 "$CERT_KEY" 2>/dev/null || true
+
+    # 确认证书文件确实被更新了
+    local fp_after
+    fp_after=$(cert_fingerprint "$CERT_FILE")
+    if [ -n "$fp_before" ] && [ "$fp_before" = "$fp_after" ]; then
+        print_warning "证书文件内容没有变化 (指纹相同)"
+        print_info "acme.sh 可能复用了未过期的证书，如需强制更换请选择「强制续期证书」"
+    fi
+
+    # 重载服务并确认状态
+    systemctl restart sing-box 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        print_success "sing-box 已重启并加载新证书"
+    else
+        print_warning "sing-box 未处于运行状态，请执行 systemctl status sing-box 检查"
+    fi
+
+    local new_expire
+    new_expire=$(cert_field -enddate)
+
+    echo ""
+    print_success "证书续期成功！"
+    print_info "新的到期时间: ${new_expire}"
+    cert_menu_return
+}
+
 fix_auto_renewal() {
     echo ""
 
-    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
-        print_error "未找到 acme.sh，无法设置自动续期"
-        echo ""
-        echo -e "${YELLOW}按任意键返回...${NC}"
-        read -n 1
-        show_cert_menu
+    if [ ! -f "$ACME_BIN" ]; then
+        print_error "未找到 acme.sh ($ACME_BIN)，无法设置自动续期"
+        cert_menu_return
         return
     fi
 
     print_info "正在修复自动续期..."
 
+    # cron 服务本身必须在运行
+    local cron_svc=""
+    for svc in cron crond cronie; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+            cron_svc="$svc"
+            break
+        fi
+    done
+    if [ -n "$cron_svc" ] && ! systemctl is-active --quiet "$cron_svc" 2>/dev/null; then
+        print_warning "${cron_svc} 服务未运行，正在启动..."
+        systemctl enable --now "$cron_svc" >/dev/null 2>&1 || true
+    fi
+
     # 安装 acme.sh 的 cron 任务
-    ~/.acme.sh/acme.sh --install-cronjob 2>/dev/null
+    "$ACME_BIN" --install-cronjob >/dev/null 2>&1 || true
 
     if crontab -l 2>/dev/null | grep -q '.acme.sh'; then
         print_success "自动续期 cron 任务已恢复"
         print_info "acme.sh 将每天自动检查证书，到期前 30 天自动续期"
     else
-        print_error "cron 任务安装失败，请手动检查 crontab"
+        print_error "cron 任务安装失败，请手动检查 crontab -l"
     fi
 
-    echo ""
-    echo -e "${YELLOW}按任意键返回...${NC}"
-    read -n 1
-    show_cert_menu
+    # 同时修正 reloadcmd: 保证自动续期后 sing-box 真正加载新证书
+    local cert_domain domain_dir ecc_flag
+    cert_domain=$(cert_domain_from_file)
+    domain_dir=$(acme_domain_dir "$cert_domain")
+    if [ -n "$cert_domain" ] && [ -n "$domain_dir" ] && ! cert_is_self_signed; then
+        ecc_flag=""
+        case "$domain_dir" in
+            *_ecc) ecc_flag="--ecc" ;;
+        esac
+        if "$ACME_BIN" --install-cert \
+            -d "$cert_domain" \
+            $ecc_flag \
+            --key-file "$CERT_KEY" \
+            --fullchain-file "$CERT_FILE" \
+            --reloadcmd "systemctl restart sing-box" >/dev/null 2>&1; then
+            chmod 644 "$CERT_FILE" 2>/dev/null || true
+            chmod 600 "$CERT_KEY" 2>/dev/null || true
+            print_success "已更新证书安装路径与重载命令 (自动续期后会重启 sing-box)"
+        else
+            print_warning "更新 reloadcmd 失败，自动续期后可能需要手动重启 sing-box"
+        fi
+    fi
+
+    cert_menu_return
 }
 
 #####################################################################
@@ -452,7 +726,7 @@ show_main_menu() {
     cat << "EOF"
 ╔═══════════════════════════════════════════════════╗
 ║                                                   ║
-║       Sing-box 管理脚本 v7.1                      ║
+║       Sing-box 管理脚本 v7.2                      ║
 ║                                                   ║
 ║   Hy2 + Reality + WS TLS + Shadowsocks 2022       ║
 ║   支持中转服务器模式 + VPS调优                    ║
@@ -1558,7 +1832,7 @@ setup_certificate() {
         source ~/.bashrc 2>/dev/null || true
     fi
     
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     
     mkdir -p /etc/sing-box/certs
     
@@ -1580,14 +1854,19 @@ setup_certificate() {
             --force 2>&1 | grep -E "success|error|failed" || true
     fi
     
+    # reloadcmd 使用 restart: sing-box 不会在 SIGHUP 时重新加载 TLS 证书，
+    # 只 reload 会导致自动续期成功但服务仍在使用旧证书
     ~/.acme.sh/acme.sh --install-cert \
         -d ${CERT_DOMAIN} \
         --ecc \
         --key-file /etc/sing-box/certs/private.key \
         --fullchain-file /etc/sing-box/certs/cert.crt \
-        --reloadcmd "systemctl reload sing-box 2>/dev/null || true" \
-        >/dev/null 2>&1
-    
+        --reloadcmd "systemctl restart sing-box" \
+        >/dev/null 2>&1 || true
+
+    # 确保自动续期的 cron 任务已安装
+    ~/.acme.sh/acme.sh --install-cronjob >/dev/null 2>&1 || true
+
     if [ -f "/etc/sing-box/certs/cert.crt" ] && [ -f "/etc/sing-box/certs/private.key" ]; then
         chmod 644 /etc/sing-box/certs/cert.crt
         chmod 600 /etc/sing-box/certs/private.key
