@@ -24,6 +24,7 @@
 - 自动生成二维码，方便手机扫码导入
 - **支持中转服务器模式**，可配置中转VPS → 落地VPS架构
 - **VPS 系统调优**，一键开启 BBR、TCP/UDP优化、降低延迟
+- **支持 IPv6**：纯 IPv4、纯 IPv6、双栈 VPS 均可使用
 
 ---
 
@@ -176,6 +177,34 @@ bash hy2_reality_install.sh
 
 ---
 
+## IPv6 支持
+
+安装时脚本会自动检测本机的 IPv4 / IPv6 公网地址：
+
+| 网络环境 | 脚本行为 |
+|---------|---------|
+| 纯 IPv4 | 与之前一样 |
+| 双栈 | 让你选择分享链接用 IPv4 还是 IPv6（默认 IPv4），两个地址都能连 |
+| 纯 IPv6 | 自动使用 IPv6；如果访问不了 GitHub，会询问是否配置 DNS64 |
+
+- sing-box 监听 `::`，同时接收 IPv4 和 IPv6 连接
+- 分享链接中的 IPv6 地址会自动加方括号，如 `vless://uuid@[2001:db8::1]:8443?...`
+- 用域名申请证书时，IPv4 加 A 记录、IPv6 加 AAAA 记录；Standalone 模式会自动监听 IPv6，有 AAAA 记录也能通过验证
+- 中转模式的落地地址可以填 IPv6，带不带方括号都行。注意中转机必须也有 IPv6 才能连接纯 IPv6 的落地机
+
+### 纯 IPv6 VPS 与 DNS64
+
+GitHub 目前没有 IPv6，纯 IPv6 机器下载不了 sing-box，落地机也访问不了只有 IPv4 的网站。脚本可以把 `/etc/resolv.conf` 改为公共 DNS64/NAT64（[nat64.net](https://nat64.net)）来解决这两个问题，原配置会备份到 `/etc/resolv.conf.bak-dns64`。
+
+恢复原 DNS：
+```bash
+cp /etc/resolv.conf.bak-dns64 /etc/resolv.conf
+```
+
+> 公共 NAT64 是第三方免费服务，访问 IPv4 网站的流量会经过它，速度和稳定性不作保证。如果 VPS 商家自己提供 NAT64，或者你装了 WARP，优先用那些。
+
+---
+
 ## VPS 系统调优
 
 脚本内置 VPS 调优功能，可显著提升代理性能、降低延迟。
@@ -247,6 +276,7 @@ journalctl -u sing-box -f
 
 | 版本 | 新增内容 |
 |------|---------|
+| v7.4 | 支持 IPv6：自动检测 IPv4/IPv6，双栈可选择连接地址，分享链接 IPv6 自动加方括号；Standalone 申请证书支持 IPv6 验证；中转落地地址支持 IPv6；纯 IPv6 可选配置 DNS64 |
 | v7.3 | 修复重新安装后所有协议连不上的问题（`systemctl start` 对已运行服务是空操作，服务仍在用旧配置）；修复 `/root/share_links.txt` 被退出清理误删 |
 | v7.2 | 修复一键续期证书失效问题（`set -e` 导致续期失败时静默退出）；新增强制续期、续期日志；「修复自动续期」增加 cron 服务检查与配置自检 |
 | v7.1 | 新增时钟同步菜单，解决 SS2022 bad timestamp 问题 |

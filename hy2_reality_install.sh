@@ -5,7 +5,7 @@
 # 协议: Hysteria 2 + VLESS Reality Vision + VLESS WS TLS + Shadowsocks 2022
 # 功能: 安装、卸载、灵活证书配置、中转服务器支持
 # 作者: Chaconne
-# 版本: 7.3
+# 版本: 7.4
 #####################################################################
 
 # 清理二维码等临时文件。注意不要用 /root/share* ——
@@ -43,7 +43,9 @@ REALITY_SHORT_ID=""
 CERT_DOMAIN=""
 CF_API_TOKEN=""
 SNI=""
-SERVER_IP=""
+SERVER_IP=""       # 分享链接使用的地址 (IPv4 或 IPv6)
+SERVER_IPV4=""
+SERVER_IPV6=""
 USE_ACME=false
 DNS_PROVIDER="standalone"
 
@@ -103,6 +105,85 @@ detect_os() {
         print_error "无法检测操作系统"
         exit 1
     fi
+}
+
+# IPv6 地址在 URL / host:port 中需要加方括号
+fmt_host() {
+    case "$1" in
+        *:*) echo "[$1]" ;;
+        *)   echo "$1" ;;
+    esac
+}
+
+# 去掉用户输入地址两侧的方括号 ([2001:db8::1] -> 2001:db8::1)
+strip_brackets() {
+    local addr="${1#[}"
+    echo "${addr%]}"
+}
+
+# 域名解析提示: A → IPv4, AAAA → IPv6
+dns_record_hint() {
+    local hint=""
+    [ -n "$SERVER_IPV4" ] && hint="A 记录 → ${SERVER_IPV4}"
+    [ -n "$SERVER_IPV6" ] && hint="${hint:+$hint, }AAAA 记录 → ${SERVER_IPV6}"
+    echo "${hint:-$SERVER_IP}"
+}
+
+# 检测本机 IPv4 / IPv6 公网地址
+detect_network_stack() {
+    print_info "检测网络环境 (IPv4 / IPv6)..."
+    SERVER_IPV4=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null \
+        || curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    SERVER_IPV6=$(curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null \
+        || curl -6 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
+    # 过滤异常返回 (HTML 错误页等)
+    [[ "$SERVER_IPV4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || SERVER_IPV4=""
+    [[ "$SERVER_IPV6" =~ ^[0-9a-fA-F:]+$ ]] || SERVER_IPV6=""
+
+    if [ -n "$SERVER_IPV4" ]; then
+        print_success "IPv4: $SERVER_IPV4"
+    else
+        print_warning "IPv4: 不可用"
+    fi
+    if [ -n "$SERVER_IPV6" ]; then
+        print_success "IPv6: $SERVER_IPV6"
+    else
+        print_warning "IPv6: 不可用"
+    fi
+
+    # 纯 IPv6 机器访问不了 GitHub 等仅 IPv4 的站点，提供 DNS64/NAT64
+    if [ -z "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ]; then
+        if ! curl -s --max-time 8 -o /dev/null https://api.github.com; then
+            echo ""
+            print_warning "纯 IPv6 环境，无法访问 GitHub (下载 sing-box 需要)"
+            echo "  可配置公共 DNS64/NAT64 (nat64.net) 来访问仅 IPv4 的站点，"
+            echo "  同时让落地机可以访问仅 IPv4 的网站。"
+            read -p "是否配置 DNS64? (y/n) [y]: " use_dns64
+            if [[ ! "$use_dns64" =~ ^[Nn]$ ]]; then
+                setup_dns64
+            fi
+        fi
+    fi
+    echo ""
+}
+
+setup_dns64() {
+    [ -e /etc/resolv.conf.bak-dns64 ] || cp -L /etc/resolv.conf /etc/resolv.conf.bak-dns64 2>/dev/null || true
+    # resolv.conf 可能是 systemd-resolved 的软链接，先删除再写入
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf <<'EOF'
+# DNS64 (nat64.net) - 由 sing-box 安装脚本写入
+# 恢复原配置: cp /etc/resolv.conf.bak-dns64 /etc/resolv.conf
+nameserver 2a00:1098:2b::1
+nameserver 2a01:4f8:c2c:123f::1
+nameserver 2a00:1098:2c::1
+EOF
+    if curl -s --max-time 8 -o /dev/null https://api.github.com; then
+        print_success "DNS64 配置成功，已可访问 GitHub"
+    else
+        print_warning "DNS64 已配置，但仍无法访问 GitHub，请检查网络"
+    fi
+    print_info "原 DNS 配置已备份到 /etc/resolv.conf.bak-dns64"
 }
 
 check_root() {
@@ -799,7 +880,7 @@ show_main_menu() {
     cat << "EOF"
 ╔═══════════════════════════════════════════════════╗
 ║                                                   ║
-║       Sing-box 管理脚本 v7.3                      ║
+║       Sing-box 管理脚本 v7.4                      ║
 ║                                                   ║
 ║   Hy2 + Reality + WS TLS + Shadowsocks 2022       ║
 ║   支持中转服务器模式 + VPS调优                    ║
@@ -1431,6 +1512,7 @@ install_singbox_menu() {
     print_success "系统: $OS $VERSION"
     
     install_dependencies
+    detect_network_stack
     check_install_singbox
     interactive_config
     setup_certificate
@@ -1543,11 +1625,25 @@ interactive_config() {
     fi
     echo ""
 
-    # 获取服务器 IP
-    print_info "正在获取服务器 IP..."
-    SERVER_IP=$(curl -s https://api.ipify.org || curl -s ifconfig.me || curl -s icanhazip.com)
+    # 确定服务器 IP (双栈时选择分享链接使用的地址)
+    if [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ]; then
+        echo -e "${YELLOW}━━━ 连接地址 ━━━${NC}"
+        echo "检测到 IPv4 + IPv6 双栈，选择分享链接使用的 IP:"
+        echo "  1) IPv4: $SERVER_IPV4"
+        echo "  2) IPv6: $SERVER_IPV6"
+        echo ""
+        read -p "请选择 [默认: 1]: " ip_choice
+        if [ "$ip_choice" = "2" ]; then
+            SERVER_IP="$SERVER_IPV6"
+        else
+            SERVER_IP="$SERVER_IPV4"
+        fi
+    else
+        SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
+    fi
     if [ -z "$SERVER_IP" ]; then
-        read -p "无法自动获取 IP，请手动输入服务器 IP: " SERVER_IP
+        read -p "无法自动获取 IP，请手动输入服务器 IP (支持 IPv6): " SERVER_IP
+        SERVER_IP=$(strip_brackets "$SERVER_IP")
     fi
     print_success "服务器 IP: $SERVER_IP"
     echo ""
@@ -1639,7 +1735,7 @@ interactive_config() {
             if [ "$dns_choice" = "2" ]; then
                 DNS_PROVIDER="cloudflare"
                 echo ""
-                print_warning "域名必须已在 Cloudflare 并解析到: ${SERVER_IP}"
+                print_warning "域名必须已在 Cloudflare 并解析到本机: $(dns_record_hint)"
                 echo ""
                 echo -e "${BLUE}获取 Cloudflare API Token:${NC}"
                 echo "  1. 访问: https://dash.cloudflare.com/profile/api-tokens"
@@ -1652,7 +1748,7 @@ interactive_config() {
                 DNS_PROVIDER="standalone"
                 print_info "将使用 Standalone 模式 (需要 80 端口)"
                 echo ""
-                print_warning "请确保域名 ${CERT_DOMAIN} 已解析到: ${SERVER_IP}"
+                print_warning "请确保域名 ${CERT_DOMAIN} 已解析到本机: $(dns_record_hint)"
                 read -p "域名是否已正确解析? (y/n): " dns_ready
                 if [[ ! "$dns_ready" =~ ^[Yy]$ ]]; then
                     print_error "请先配置 DNS 解析后再运行此脚本"
@@ -1726,7 +1822,8 @@ interactive_config() {
         echo "请输入落地服务器的配置信息"
         echo ""
 
-        read -p "落地服务器地址 (IP或域名): " RELAY_BACKEND_ADDR
+        read -p "落地服务器地址 (IPv4/IPv6/域名): " RELAY_BACKEND_ADDR
+        RELAY_BACKEND_ADDR=$(strip_brackets "$RELAY_BACKEND_ADDR")
         if [ -z "$RELAY_BACKEND_ADDR" ]; then
             print_error "落地服务器地址不能为空"
             exit 1
@@ -1920,9 +2017,17 @@ setup_certificate() {
             --force 2>&1 | grep -E "success|error|failed" || true
     else
         print_info "使用 Standalone 模式申请证书..."
+        # 有 IPv6 时监听 IPv6 (Linux 默认双栈 socket 同时接收 IPv4)，
+        # 否则域名有 AAAA 记录时 Let's Encrypt 优先走 IPv6 验证会失败
+        local listen_opt=""
+        if [ -n "$SERVER_IPV6" ]; then
+            if [ -z "$SERVER_IPV4" ] || [ "$(sysctl -n net.ipv6.bindv6only 2>/dev/null)" != "1" ]; then
+                listen_opt="--listen-v6"
+            fi
+        fi
         ~/.acme.sh/acme.sh --issue \
             -d ${CERT_DOMAIN} \
-            --standalone \
+            --standalone ${listen_opt} \
             --keylength ec-256 \
             --force 2>&1 | grep -E "success|error|failed" || true
     fi
@@ -2292,32 +2397,35 @@ generate_share_info() {
     else
         CONNECT_ADDR="$SERVER_IP"
     fi
+    # 链接 / host:port 中使用的形式 (IPv6 加方括号)
+    CONNECT_HOST=$(fmt_host "$CONNECT_ADDR")
+    SERVER_HOST=$(fmt_host "$SERVER_IP")
 
     # 按已选协议生成分享链接
     if [ "$INSTALL_HY2" = true ]; then
         if [ "$USE_ACME" = true ]; then
             HY2_LINK="hysteria2://${HY2_PASSWORD}@${CERT_DOMAIN}:${HY2_PORT}/?insecure=0&sni=${CERT_DOMAIN}#${CERT_DOMAIN}"
         else
-            HY2_LINK="hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}/?insecure=1#Hysteria2-${SERVER_IP}"
+            HY2_LINK="hysteria2://${HY2_PASSWORD}@${SERVER_HOST}:${HY2_PORT}/?insecure=1#Hysteria2-${SERVER_IP}"
         fi
     fi
 
     if [ "$INSTALL_REALITY" = true ]; then
-        VLESS_LINK="vless://${REALITY_UUID}@${CONNECT_ADDR}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#Reality-${CONNECT_ADDR}"
+        VLESS_LINK="vless://${REALITY_UUID}@${CONNECT_HOST}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&headerType=none#Reality-${CONNECT_ADDR}"
     fi
 
     if [ "$INSTALL_VLESS_WS" = true ]; then
         if [ "$USE_ACME" = true ]; then
             VLESS_WS_LINK="vless://${VLESS_WS_UUID}@${CERT_DOMAIN}:${VLESS_WS_PORT}?encryption=none&security=tls&sni=${CERT_DOMAIN}&type=ws&host=${CERT_DOMAIN}&path=$(echo ${VLESS_WS_PATH} | sed 's/\//%2F/g')#VLESS-WS-${CERT_DOMAIN}"
         else
-            VLESS_WS_LINK="vless://${VLESS_WS_UUID}@${SERVER_IP}:${VLESS_WS_PORT}?encryption=none&security=tls&sni=${SERVER_IP}&type=ws&host=${SERVER_IP}&path=$(echo ${VLESS_WS_PATH} | sed 's/\//%2F/g')&allowInsecure=1#VLESS-WS-${SERVER_IP}"
+            VLESS_WS_LINK="vless://${VLESS_WS_UUID}@${SERVER_HOST}:${VLESS_WS_PORT}?encryption=none&security=tls&sni=${SERVER_IP}&type=ws&host=${SERVER_HOST}&path=$(echo ${VLESS_WS_PATH} | sed 's/\//%2F/g')&allowInsecure=1#VLESS-WS-${SERVER_IP}"
         fi
     fi
 
     if [ "$INSTALL_SS2022" = true ]; then
         local SS2022_USERINFO
         SS2022_USERINFO=$(printf '%s' "${SS2022_METHOD}:${SS2022_PASSWORD}" | base64 -w 0)
-        SS2022_LINK="ss://${SS2022_USERINFO}@${CONNECT_ADDR}:${SS2022_PORT}#SS2022-${CONNECT_ADDR}"
+        SS2022_LINK="ss://${SS2022_USERINFO}@${CONNECT_HOST}:${SS2022_PORT}#SS2022-${CONNECT_ADDR}"
     fi
 
     # 生成配置文件 (分段写入，按已选协议)
@@ -2331,6 +2439,7 @@ generate_share_info() {
   类型: $([ "$SERVER_TYPE" = "relay" ] && echo "中转服务器" || echo "落地服务器")
   IP 地址: ${SERVER_IP}
 EOF
+        [ -n "$SERVER_IPV4" ] && [ -n "$SERVER_IPV6" ] && echo "  双栈: IPv4 ${SERVER_IPV4} / IPv6 ${SERVER_IPV6}"
         [ "$USE_ACME" = true ] && echo "  域名: ${CERT_DOMAIN}"
         [ "$USE_ACME" = true ] && echo "  证书: Let's Encrypt ($DNS_PROVIDER)" || echo "  证书: 自签名证书 (Reality/SS2022无需证书)"
         echo ""
@@ -2343,11 +2452,11 @@ Hysteria 2 配置
 
 端口: ${HY2_PORT}
 密码: ${HY2_PASSWORD}
-连接: ${CONNECT_ADDR}:${HY2_PORT}
+连接: ${CONNECT_HOST}:${HY2_PORT}
 
 客户端配置 (YAML):
 ---
-server: ${CONNECT_ADDR}:${HY2_PORT}
+server: ${CONNECT_HOST}:${HY2_PORT}
 auth: ${HY2_PASSWORD}
 tls:
 $([ "$USE_ACME" = true ] && echo "  sni: ${CERT_DOMAIN}" || echo "  insecure: true")
@@ -2503,7 +2612,7 @@ EOF
         if [ "$USE_ACME" = true ]; then
             echo -e "${CYAN}连接: ${CERT_DOMAIN}:${HY2_PORT}${NC}"
         else
-            echo -e "${CYAN}连接: ${SERVER_IP}:${HY2_PORT}${NC}"
+            echo -e "${CYAN}连接: ${SERVER_HOST}:${HY2_PORT}${NC}"
             echo -e "${YELLOW}注意: 客户端需设置 insecure: true${NC}"
         fi
         echo -e "${CYAN}密码: ${HY2_PASSWORD}${NC}"
@@ -2523,7 +2632,7 @@ EOF
         echo -e "${GREEN}  VLESS Reality 配置${NC}"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        echo -e "${CYAN}连接: ${CONNECT_ADDR}:${REALITY_PORT}${NC}"
+        echo -e "${CYAN}连接: ${CONNECT_HOST}:${REALITY_PORT}${NC}"
         echo -e "${CYAN}UUID: ${REALITY_UUID}${NC}"
         echo -e "${CYAN}SNI:  ${SNI}${NC}"
         echo ""
@@ -2545,7 +2654,7 @@ EOF
         if [ "$USE_ACME" = true ]; then
             echo -e "${CYAN}连接: ${CERT_DOMAIN}:${VLESS_WS_PORT}${NC}"
         else
-            echo -e "${CYAN}连接: ${SERVER_IP}:${VLESS_WS_PORT}${NC}"
+            echo -e "${CYAN}连接: ${SERVER_HOST}:${VLESS_WS_PORT}${NC}"
             echo -e "${YELLOW}注意: 客户端需允许不安全连接${NC}"
         fi
         echo -e "${CYAN}UUID: ${VLESS_WS_UUID}${NC}"
@@ -2566,7 +2675,7 @@ EOF
         echo -e "${GREEN}  Shadowsocks 2022 配置${NC}"
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo ""
-        echo -e "${CYAN}连接: ${CONNECT_ADDR}:${SS2022_PORT}${NC}"
+        echo -e "${CYAN}连接: ${CONNECT_HOST}:${SS2022_PORT}${NC}"
         echo -e "${CYAN}加密: ${SS2022_METHOD}${NC}"
         echo -e "${CYAN}密码: ${SS2022_PASSWORD}${NC}"
         echo ""
